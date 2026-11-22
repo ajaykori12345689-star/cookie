@@ -1,8 +1,16 @@
 const express = require('express');
 const multer = require('multer');
-const login = require('@dongdev/fca-unofficial');
 const fs = require('fs');
 const path = require('path');
+
+let login = null;
+async function getLogin() {
+    if (!login) {
+        const mod = await import('@dongdev/fca-unofficial');
+        login = mod.default || mod;
+    }
+    return login;
+}
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -72,16 +80,18 @@ function parseCookies(cookiesRaw) {
 }
 
 async function setupFcaSession(appState) {
+    const loginFn = await getLogin();
+
     // Bina proxy ke direct login
     const loginPromise = new Promise((resolve, reject) => {
-        login({ appState: appState }, (err, api) => {
+        loginFn({ appState: appState }, (err, api) => {
             if (err) return reject(err);
             resolve(api);
         });
     });
 
     // Agar 10 second me login nahi hua toh timeout
-    const timeoutPromise = new Promise((_, reject) => 
+    const timeoutPromise = new Promise((_, reject) =>
         setTimeout(() => reject(new Error("Timeout - Cookie dead ya IP blocked")), 10000)
     );
 
@@ -145,7 +155,7 @@ async function runSenderProcess(cookiePoolRaw, threadId, delay, senderName, file
                         try {
                             const newSession = await getWorkingApi(cookiePool, currentPoolIndex + 1);
                             api = newSession.api; currentPoolIndex = newSession.poolIndex;
-                            attempt = -1; 
+                            attempt = -1;
                             continue;
                         } catch (rotateErr) { throw new Error("All cookies dead."); }
                     } else {
