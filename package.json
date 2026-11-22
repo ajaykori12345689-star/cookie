@@ -1,26 +1,22 @@
 {
-  "name": "ayush-247-messenger-bot",
+  "name": "raw-cookies-fb-bot",
   "version": "1.0.0",
-  "description": "Ayush's 24/7 Messenger Bot with primary and backup cookies auto-reconnect.",
+  "description": "A Facebook message sender using raw cookies and WebSocket control.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "DEBUG=1 node server.js"
+    "start": "node server.js"
   },
   "keywords": [
-    "messenger",
-    "bot",
-    "messagix",
-    "24x7"
+    "facebook",
+    "fca",
+    "websocket",
+    "express"
   ],
-  "author": "Ayush",
-  "license": "MIT",
-  "engines": {
-    "node": ">=18.0.0"
-  },
+  "author": "",
+  "license": "ISC",
   "dependencies": {
     "express": "^4.19.2",
-    "messagix-js": "0.1.0",
+    "fca-mafiya": "latest",
     "ws": "^8.18.0"
   }
 }
