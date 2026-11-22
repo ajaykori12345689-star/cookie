@@ -1,17 +1,27 @@
 {
-  "name": "cookies-server-rk-raja",
+  "name": "ayush-247-messenger-bot",
   "version": "1.0.0",
-  "description": "Cookies Server",
+  "description": "Ayush's 24/7 Messenger Bot — persistent task runner with primary/backup cookies, auto-reconnect, and JSONBin persistence.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "DEBUG=1 node server.js"
+  },
+  "keywords": [
+    "messenger",
+    "bot",
+    "24x7",
+    "messagix",
+    "ayush"
+  ],
+  "author": "Ayush",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
   },
   "dependencies": {
-    "@dongdev/fca-unofficial": "latest",
     "express": "^4.19.2",
-    "multer": "^1.4.5-lts.1"
-  },
-  "engines": {
-    "node": "18.x"
+    "messagix-js": "^1.0.0",
+    "ws": "^8.18.0"
   }
 }
