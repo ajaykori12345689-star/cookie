@@ -1,188 +1,635 @@
-const express = require('express');
-const multer = require('multer');
-const fs = require('fs');
-const path = require('path');
-
-let login = null;
-async function getLogin() {
-    if (!login) {
-        const mod = await import('@dongdev/fca-unofficial');
-        login = mod.default || mod;
-    }
-    return login;
+// ============================================================
+// 🔇 TERMINAL SILENCE — Zero logs on server
+// Saare console.log/info/warn/error/debug → noop
+// DEBUG=1 env set karo to logs wapas on ho jayenge (agar kabhi chahiye)
+// ============================================================
+if (process.env.DEBUG !== '1') {
+    const noop = () => {};
+    console.log = noop;
+    console.info = noop;
+    console.warn = noop;
+    console.error = noop;
+    console.debug = noop;
 }
+
+// ============================================================
+// Core imports
+// ============================================================
+global.WebSocket = require('ws');
+
+const express = require('express');
+const { MessengerClient, Platform, CookieManager } = require('messagix-js');
+const crypto = require('crypto');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+const DB_FILE = './tasks.json';
 
-if (!fs.existsSync('uploads')) fs.mkdirSync('uploads', { recursive: true });
-const upload = multer({ dest: 'uploads/' });
+// Optional JSONBin persistence
+const JSONBIN_BIN_ID = process.env.JSONBIN_BIN_ID || '';
+const JSONBIN_API_KEY = process.env.JSONBIN_API_KEY || '';
 
-let serverState = { isRunning: false, status: "Idle", logs: [], totalSent: 0, totalFailed: 0, stopRequested: false };
+// ==================== CONSTANTS ====================
+const CONNECT_TIMEOUT_MS = 25000;
+const SEND_TIMEOUT_MS = 15000;
+const PRIMARY_RETRIES = 3;
+const BACKUP_RETRIES = 2;
+const MAX_CONNECT_FAILS = 10;
+const BACKOFF_STEPS_MS = [60000, 120000, 240000, 300000];
+const SEND_RETRY_BACKOFF_MS = [3000, 6000, 12000, 30000, 60000];
+const SAVE_MIN_INTERVAL_MS = 30000;
+const SAVE_DEBOUNCE_MS = 5000;
+const MAX_LOG_LINES = 60;
+const RESTORE_STAGGER_MS = 4000;
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+// ==================== STATE ====================
+const activeTasks = new Map();
 
-function addLog(msg) {
-    const time = new Date().toLocaleTimeString();
-    const logMsg = `[${time}] ${msg}`;
-    serverState.logs.push(logMsg);
-    if (serverState.logs.length > 200) serverState.logs.shift();
-    console.log(logMsg);
+let isShuttingDown = false;
+let saveTimer = null;
+let saveInProgress = false;
+let lastSaveAt = 0;
+let saveDirty = false;
+
+// ==================== ANTI-CRASH ====================
+process.on('uncaughtException', () => {});
+process.on('unhandledRejection', () => {});
+
+// ==================== HELPERS ====================
+function getUptimeString(startTime) {
+    const diff = Date.now() - startTime;
+    const d = Math.floor(diff / 86400000);
+    const h = Math.floor((diff % 86400000) / 3600000);
+    const m = Math.floor((diff % 3600000) / 60000);
+    return `${d} Days, ${h} Hours, ${m} Mins`;
 }
 
-app.get('/api/status', (req, res) => res.json(serverState));
-
-app.post('/api/stop', (req, res) => {
-    if (!serverState.isRunning) return res.json({ status: "error", message: "Server pehle se band hai." });
-    serverState.stopRequested = true;
-    serverState.status = "Stopping...";
-    addLog("🛑 STOP signal received.");
-    res.json({ status: "success", message: "Stop signal bhej diya gaya." });
-});
-
-app.post('/api/start', upload.single('message_file'), async (req, res) => {
-    if (serverState.isRunning) return res.json({ status: "error", message: "Server pehle se chal raha hai!" });
-
-    const cookie_pool = req.body.cookie_pool;
-    const thread_id = req.body.thread_id;
-    const time_delay = req.body.time_delay;
-    const sender_name = req.body.sender_name;
-    const file = req.file;
-
-    if (!cookie_pool || cookie_pool.trim() === '') return res.json({ status: "error", message: "❌ Cookie Pool khali hai!" });
-    if (!thread_id || thread_id.trim() === '') return res.json({ status: "error", message: "❌ Group UID dalna bhool gaye ho!" });
-    if (!file) return res.json({ status: "error", message: "❌ Message File upload nahi hui hai!" });
-
-    serverState = { isRunning: true, status: "Initializing...", logs: [], totalSent: 0, totalFailed: 0, stopRequested: false };
-
-    res.json({ status: "success", message: "Server chalu ho gaya!" });
-    runSenderProcess(cookie_pool, thread_id, parseInt(time_delay), sender_name, file.path);
-});
-
-function parsePool(poolRaw) { return poolRaw.split('---').map(c => c.trim()).filter(c => c !== ''); }
-
-function parseCookies(cookiesRaw) {
-    let appState = [];
-    try {
-        const parsed = JSON.parse(cookiesRaw);
-        appState = parsed.map(c => ({ key: c.key, value: c.value, domain: "facebook.com", path: "/" }));
-    } catch (e) {
-        cookiesRaw.split(';').forEach(pair => {
-            const [k, v] = pair.split('=');
-            if (k && v) appState.push({ key: k.trim(), value: v.trim(), domain: "facebook.com", path: "/" });
-        });
+function pushLog(task, msg) {
+    task.logs.push(`[${new Date().toLocaleTimeString()}] ${msg}`);
+    if (task.logs.length > MAX_LOG_LINES) {
+        task.logs.splice(0, task.logs.length - MAX_LOG_LINES);
     }
-    return appState;
 }
 
-async function setupFcaSession(appState) {
-    const loginFn = await getLogin();
-
-    // Bina proxy ke direct login
-    const loginPromise = new Promise((resolve, reject) => {
-        loginFn({ appState: appState }, (err, api) => {
-            if (err) return reject(err);
-            resolve(api);
-        });
+function withTimeout(promise, ms, label) {
+    let timer;
+    const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timeout ${ms}ms`)), ms);
     });
-
-    // Agar 10 second me login nahi hua toh timeout
-    const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Timeout - Cookie dead ya IP blocked")), 10000)
-    );
-
-    const api = await Promise.race([loginPromise, timeoutPromise]);
-
-    api.setOptions({ listenEvents: false, selfListen: false, forceLogin: true, autoMarkRead: false });
-    api.listenMqtt((err) => { if (err) console.log(`MQTT Error: ${err.message}`); });
-
-    return { api };
+    return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
 }
 
-async function getWorkingApi(cookiePool, startIndex) {
-    for (let i = startIndex; i < cookiePool.length; i++) {
+async function interruptibleSleep(ms) {
+    const step = 1000;
+    for (let elapsed = 0; elapsed < ms; elapsed += step) {
+        if (isShuttingDown) return false;
+        await new Promise(r => setTimeout(r, Math.min(step, ms - elapsed)));
+    }
+    return true;
+}
+
+function backoffFor(failCount) {
+    if (failCount <= 0) return BACKOFF_STEPS_MS[0];
+    const idx = Math.min(failCount - 1, BACKOFF_STEPS_MS.length - 1);
+    return BACKOFF_STEPS_MS[idx];
+}
+
+// ==================== SAVE (DEBOUNCED) ====================
+function scheduleSave(force = false) {
+    saveDirty = true;
+
+    if (force) {
+        if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+        return doSave();
+    }
+
+    if (saveTimer) return;
+
+    const wait = Math.max(SAVE_DEBOUNCE_MS, SAVE_MIN_INTERVAL_MS - (Date.now() - lastSaveAt));
+    saveTimer = setTimeout(() => {
+        saveTimer = null;
+        doSave();
+    }, wait);
+}
+
+async function doSave() {
+    if (saveInProgress) { saveDirty = true; return; }
+    saveInProgress = true;
+    saveDirty = false;
+    lastSaveAt = Date.now();
+
+    const out = {};
+    for (const [id, t] of activeTasks.entries()) {
+        out[id] = {
+            cookies: t.cookies,
+            backupCookies: t.backupCookies || '',
+            threadId: t.threadId,
+            hatersName: t.hatersName,
+            messages: t.messages,
+            delaySec: t.delaySec,
+            status: t.status,
+            startTime: t.startTime,
+            logs: t.logs.slice(-MAX_LOG_LINES),
+            activeCookieSource: t.activeCookieSource || 'primary'
+        };
+    }
+
+    try {
+        if (JSONBIN_BIN_ID && JSONBIN_API_KEY) {
+            await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Master-Key': JSONBIN_API_KEY
+                },
+                body: JSON.stringify(out)
+            });
+        } else {
+            fs.writeFileSync(DB_FILE, JSON.stringify(out, null, 2));
+        }
+    } catch (_) {
+        // silent
+    } finally {
+        saveInProgress = false;
+        if (saveDirty) scheduleSave(false);
+    }
+}
+
+// ==================== RESTORE ====================
+async function loadTasks() {
+    try {
+        let dataRecord = null;
+        if (JSONBIN_BIN_ID && JSONBIN_API_KEY) {
+            const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}/latest`, {
+                headers: { 'X-Master-Key': JSONBIN_API_KEY }
+            });
+            const j = await res.json();
+            dataRecord = j.record;
+        } else if (fs.existsSync(DB_FILE)) {
+            dataRecord = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+        }
+
+        if (!dataRecord) return;
+
+        const toRestore = [];
+        for (const [taskId, taskData] of Object.entries(dataRecord)) {
+            if (taskData.status === 'running') {
+                activeTasks.set(taskId, {
+                    ...taskData,
+                    client: null,
+                    forceReconnect: false,
+                    connectFailCount: 0,
+                    sendFailCount: 0
+                });
+                toRestore.push(taskId);
+            }
+        }
+
+        for (let i = 0; i < toRestore.length; i++) {
+            const id = toRestore[i];
+            if (i > 0) await new Promise(r => setTimeout(r, RESTORE_STAGGER_MS));
+            if (isShuttingDown) break;
+            runPersistentTask(id);
+        }
+    } catch (_) {
+        // silent
+    }
+}
+
+// ==================== HEALTH ====================
+app.head('/', (req, res) => res.status(200).end());
+app.get('/ping', (req, res) => res.send('Pong'));
+app.get('/health', (req, res) => res.json({
+    status: 'ONLINE',
+    uptime: Math.round(process.uptime()),
+    isShuttingDown,
+    activeTasks: activeTasks.size,
+    taskIds: Array.from(activeTasks.keys())
+}));
+
+// ==================== HTML UI ====================
+app.get('/', (req, res) => {
+    res.send(`<!DOCTYPE html><html lang="hi"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ayush's 24/7 Bot</title>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+body{font-family:Rajdhani,sans-serif;background:radial-gradient(circle at 20% 10%,#1e1b4b 0%,#0f172a 45%,#020617 100%);color:#e2e8f0;padding:20px;margin:0;min-height:100vh}
+.c{max-width:680px;margin:auto;background:linear-gradient(160deg,rgba(30,41,59,.85),rgba(15,23,42,.95));padding:30px;border-radius:20px;box-shadow:0 0 60px rgba(56,189,248,.18),0 0 120px rgba(168,85,247,.12),inset 0 1px 0 rgba(255,255,255,.06);border:1px solid rgba(56,189,248,.25);backdrop-filter:blur(10px)}
+h2{text-align:center;margin:0 0 5px;font-family:Orbitron,sans-serif;font-size:26px;letter-spacing:1px;background:linear-gradient(90deg,#38bdf8,#a855f7,#f472b6);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;text-shadow:0 0 30px rgba(56,189,248,.3)}
+.b{text-align:center;background:linear-gradient(135deg,#06b6d4,#8b5cf6);color:#fff;display:block;padding:5px 18px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:2px;margin:0 auto 20px;width:fit-content;box-shadow:0 0 20px rgba(139,92,246,.5);font-family:Orbitron,sans-serif}
+label{font-weight:600;margin-top:15px;display:block;font-size:14px;color:#94a3b8;letter-spacing:.5px}
+input,textarea{width:100%;padding:12px;margin-top:6px;border-radius:10px;border:1.5px solid rgba(56,189,248,.25);background:rgba(2,6,23,.6);box-sizing:border-box;font-family:Rajdhani;font-size:15px;color:#e2e8f0;transition:border-color .2s,box-shadow .2s}
+input:focus,textarea:focus{outline:none;border-color:#38bdf8;box-shadow:0 0 0 3px rgba(56,189,248,.15),0 0 20px rgba(56,189,248,.2)}
+textarea{height:80px;resize:vertical}
+.fb{margin-top:6px;background:rgba(56,189,248,.06);border:1.5px dashed rgba(56,189,248,.5);padding:12px;border-radius:10px;text-align:center;cursor:pointer;transition:all .2s}
+.fb:hover{background:rgba(56,189,248,.12);border-color:#38bdf8;box-shadow:0 0 20px rgba(56,189,248,.2)}
+.fb input{display:none}
+.fl{color:#38bdf8;font-weight:600;font-size:13px;cursor:pointer}
+button{padding:14px;border:none;border-radius:10px;font-weight:700;cursor:pointer;font-size:15px;width:100%;margin-top:15px;color:#fff;font-family:Rajdhani;letter-spacing:.5px;transition:transform .15s,box-shadow .2s}
+button:active{transform:scale(.98)}
+.bs{background:linear-gradient(135deg,#06b6d4,#6366f1);box-shadow:0 0 25px rgba(99,102,241,.4)}
+.bs:hover{box-shadow:0 0 35px rgba(99,102,241,.7)}
+.bc{background:linear-gradient(135deg,#8b5cf6,#d946ef);box-shadow:0 0 25px rgba(168,85,247,.4)}
+.bc:hover{box-shadow:0 0 35px rgba(168,85,247,.7)}
+.bt{background:linear-gradient(135deg,#ef4444,#f43f5e);box-shadow:0 0 25px rgba(239,68,68,.4)}
+.bt:hover{box-shadow:0 0 35px rgba(239,68,68,.7)}
+.con{background:#020617;color:#4ade80;padding:15px;border-radius:10px;height:250px;overflow-y:auto;font-family:'Courier New',monospace;font-size:12px;margin-top:10px;border:1px solid rgba(56,189,248,.2);box-shadow:inset 0 0 30px rgba(0,0,0,.6)}
+.tb{margin-top:30px;border-top:1.5px dashed rgba(56,189,248,.25);padding:15px;background:rgba(2,6,23,.5);border-radius:15px}
+.sb{display:inline-block;padding:5px 14px;border-radius:12px;font-size:12px;font-weight:700;background:rgba(56,189,248,.15);color:#38bdf8;margin-top:10px;letter-spacing:.5px}
+.sb.err{background:rgba(239,68,68,.15);color:#f87171}
+.sb.ok{background:rgba(34,197,94,.15);color:#4ade80}
+h3{font-family:Orbitron,sans-serif;font-size:16px;color:#a855f7;letter-spacing:1px;margin:0 0 5px}
+</style></head><body><div class="c">
+<h2>⚡ 24/7 MESSENGER BOT ⚡</h2>
+<span class="b">DEVELOPER: AYUSH</span>
+<form id="f">
+<label>Primary Cookies (Required):</label>
+<textarea name="cookies" placeholder="c_user=...; xs=...;" required></textarea>
+<label>Backup Cookies (Optional):</label>
+<textarea name="backupCookies" placeholder="Agar primary fail ho jaye to ye use hongi..."></textarea>
+<label>Target ID:</label>
+<input type="text" name="threadId" placeholder="Group/User ID" required>
+<label>Haters Name (Prefix):</label>
+<input type="text" name="hatersName" placeholder="Optional">
+<label>Messages:</label>
+<div class="fb" onclick="document.getElementById('mf').click()">
+<span class="fl" id="fl">📁 Upload Messages File</span>
+<input type="file" id="mf" accept=".txt" onchange="loadF(event)">
+</div>
+<textarea name="messages" id="mb" placeholder="Hello&#10;Test" required></textarea>
+<label>Delay (Seconds):</label>
+<input type="number" name="delay" value="10" min="2" required>
+<button type="submit" class="bs">🚀 Start 24/7 Task</button>
+</form>
+<div class="tb">
+<h3>🔍 Task Control</h3>
+<label>Task ID:</label>
+<input type="text" id="tid" placeholder="Paste Task ID">
+<div style="display:flex;gap:10px">
+<button type="button" class="bc" onclick="check()">👁️ Check</button>
+<button type="button" class="bt" onclick="del()">🗑️ Delete</button>
+</div>
+<div style="margin-top:15px;border-top:1px dashed rgba(56,189,248,.25);padding-top:10px">
+<label>Update Primary Cookies:</label>
+<textarea id="nc" placeholder="Nayi primary cookies" style="height:50px"></textarea>
+<label>Update Backup Cookies:</label>
+<textarea id="nb" placeholder="Nayi backup cookies" style="height:50px"></textarea>
+<button type="button" class="bc" onclick="upd()">🔄 Update Cookies</button>
+</div>
+<div id="si" class="sb" style="display:none"></div>
+<div class="con" id="cl">Waiting...</div>
+</div></div>
+<script>
+let iv;
+function loadF(e){const f=e.target.files[0];if(!f)return;document.getElementById('fl').innerText="📄 "+f.name;const r=new FileReader();r.onload=x=>document.getElementById('mb').value=x.target.result;r.readAsText(f);}
+document.getElementById('f').addEventListener('submit',async e=>{
+e.preventDefault();
+const fd=new FormData(e.target);
+const r=await fetch('/start-task',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(fd))});
+const j=await r.json();
+if(j.success){alert("Task ID: "+j.taskId+"\\n\\nIse save karein!");document.getElementById('tid').value=j.taskId;check();}
+else alert('Error: '+j.error);
+});
+function check(){
+const id=document.getElementById('tid').value.trim();
+if(!id)return alert('Task ID daaliye!');
+if(iv)clearInterval(iv);
+iv=setInterval(async()=>{
+try{
+const r=await fetch('/logs/'+id);const d=await r.json();
+const cl=document.getElementById('cl'),si=document.getElementById('si');
+if(d.success){
+si.style.display="block";
+si.className="sb"+(d.status==='error'?' err':(d.status==='running'?' ok':''));
+si.innerHTML="🟢 "+d.status.toUpperCase()+" | ⏱️ "+d.uptime+" | "+d.activeCookieSource;
+cl.innerHTML=d.logs.join('<br>');cl.scrollTop=cl.scrollHeight;
+if(d.status==='error'||d.status==='stopped'){clearInterval(iv);}
+}else{clearInterval(iv);si.style.display="none";cl.innerHTML=d.message||"Not found!";}
+}catch(e){}
+},2000);
+}
+async function del(){
+const id=document.getElementById('tid').value.trim();
+if(!id)return alert('Task ID daaliye!');
+if(confirm("STOP aur DELETE karein?")){
+const r=await fetch('/stop-task/'+id,{method:'POST'});const j=await r.json();
+alert(j.message);if(iv)clearInterval(iv);
+document.getElementById('cl').innerHTML="Deleted.";document.getElementById('si').style.display="none";
+}
+}
+async function upd(){
+const id=document.getElementById('tid').value.trim();
+const nc=document.getElementById('nc').value.trim();
+const nb=document.getElementById('nb').value.trim();
+if(!id)return alert('Task ID daaliye!');
+if(!nc&&!nb)return alert('Cookies daaliye!');
+const r=await fetch('/update-cookies/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({newCookies:nc,newBackup:nb})});
+const j=await r.json();alert(j.message);
+if(j.success){document.getElementById('nc').value='';document.getElementById('nb').value='';}
+}
+</script></body></html>`);
+});
+
+// ==================== START TASK ====================
+app.post('/start-task', async (req, res) => {
+    try {
+        const { cookies, backupCookies, threadId, hatersName, messages, delay } = req.body;
+
+        if (!cookies || !cookies.trim()) return res.status(400).json({ success: false, error: 'Cookies required' });
+        if (!threadId || !threadId.trim()) return res.status(400).json({ success: false, error: 'Thread ID required' });
+        if (!messages || !messages.trim()) return res.status(400).json({ success: false, error: 'Messages required' });
+
+        const messageList = messages.split('\n').map(m => m.trim()).filter(Boolean);
+        if (messageList.length === 0) return res.status(400).json({ success: false, error: 'No valid messages' });
+
+        const taskId = crypto.randomBytes(4).toString('hex');
+
+        let backup = (backupCookies || '').trim();
+        if (backup && backup === cookies.trim()) backup = '';
+
+        const task = {
+            cookies: cookies.trim(),
+            backupCookies: backup,
+            threadId: threadId.trim(),
+            hatersName: (hatersName || '').trim(),
+            messages: messageList,
+            delaySec: Math.max(2, parseInt(delay) || 10),
+            logs: [],
+            status: 'running',
+            startTime: Date.now(),
+            activeCookieSource: 'primary',
+            forceReconnect: false,
+            client: null,
+            connectFailCount: 0,
+            sendFailCount: 0
+        };
+
+        pushLog(task, `Task ${taskId} created.`);
+        if (backup) pushLog(task, '🛡️ Backup cookies enabled.');
+
+        activeTasks.set(taskId, task);
+
+        await scheduleSave(true);
+        res.json({ success: true, taskId });
+
+        runPersistentTask(taskId);
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// ==================== UPDATE COOKIES ====================
+app.post('/update-cookies/:taskId', async (req, res) => {
+    const task = activeTasks.get(req.params.taskId);
+    if (!task || task.status !== 'running') {
+        return res.status(404).json({ success: false, message: 'Task not found or not running.' });
+    }
+
+    if (req.body.newCookies && req.body.newCookies.trim()) {
+        task.cookies = req.body.newCookies.trim();
+    }
+    if (req.body.newBackup !== undefined) {
+        let newBackup = (req.body.newBackup || '').trim();
+        if (newBackup && newBackup === task.cookies) newBackup = '';
+        task.backupCookies = newBackup;
+    }
+
+    task.forceReconnect = true;
+    task.activeCookieSource = 'primary';
+    task.connectFailCount = 0;
+    pushLog(task, '🔄 Cookies updated by user. Reconnecting...');
+
+    await scheduleSave(true);
+    res.json({ success: true, message: 'Cookies updated! Bot next cycle mein nayi cookies use karega.' });
+});
+
+// ==========================================
+// 🚀 PERSISTENT TASK RUNNER
+// ==========================================
+async function runPersistentTask(taskId) {
+    const task = activeTasks.get(taskId);
+    if (!task) return;
+
+    let msgIndex = 0;
+    let loopCount = 1;
+
+    async function tryConnect(cookies) {
+        let nc = null;
         try {
-            const appState = parseCookies(cookiePool[i]);
-            addLog(`🔐 Trying Cookie #${i + 1}...`);
-            const session = await setupFcaSession(appState);
-            addLog(`✅ Cookie #${i + 1} Login Successful!`);
-            return { api: session.api, poolIndex: i };
-        } catch (err) {
-            addLog(`❌ Cookie #${i + 1} Failed: ${err.message}`);
+            const cm = CookieManager.fromString(Platform.Messenger, cookies);
+            nc = new MessengerClient({
+                platform: Platform.Messenger,
+                cookies: cm.getAll(),
+                enableE2EE: false
+            });
+
+            await withTimeout(nc.loadMessagesPage(), CONNECT_TIMEOUT_MS, 'loadMessagesPage');
+            await withTimeout(nc.connect(), CONNECT_TIMEOUT_MS, 'connect');
+            return nc;
+        } catch (e) {
+            if (nc) { try { await nc.disconnect(); } catch (_) {} }
+            throw e;
         }
     }
-    throw new Error("Saari cookies dead hain ya timeout ho gayi!");
-}
 
-async function runSenderProcess(cookiePoolRaw, threadId, delay, senderName, filePath) {
-    const cookiePool = parsePool(cookiePoolRaw);
-    let api = null, currentPoolIndex = 0;
+    async function doDisconnect() {
+        const c = task.client;
+        task.client = null;
+        if (c) {
+            try { await c.disconnect(); } catch (_) {}
+        }
+    }
 
-    try {
-        const initial = await getWorkingApi(cookiePool, currentPoolIndex);
-        api = initial.api; currentPoolIndex = initial.poolIndex;
+    while (activeTasks.has(taskId) && task.status === 'running' && !isShuttingDown) {
 
-        serverState.status = "Sending Messages...";
-        addLog("🚀 Started Sending Non-Stop!");
+        if (task.forceReconnect) {
+            task.forceReconnect = false;
+            await doDisconnect();
+        }
 
-        const messages = fs.readFileSync(filePath, 'utf-8').split('\n').map(m => m.trim()).filter(m => m.length > 0);
-        if (messages.length === 0) throw new Error("File khali hai.");
+        // ========== CONNECT PHASE ==========
+        if (!task.client) {
+            let connected = false;
 
-        for (let i = 0; i < messages.length; i++) {
-            if (serverState.stopRequested) break;
+            for (let i = 1; i <= PRIMARY_RETRIES; i++) {
+                if (!activeTasks.has(taskId) || task.status !== 'running' || isShuttingDown) return;
 
-            const finalMessage = `${senderName}\n${messages[i]}`;
-            let success = false;
+                pushLog(task, `🔌 [PRIMARY] Attempt ${i}/${PRIMARY_RETRIES}...`);
+                await scheduleSave(false);
 
-            for (let attempt = 0; attempt < 2; attempt++) {
                 try {
-                    await new Promise((resolve, reject) => {
-                        api.sendMessage(finalMessage, threadId, (err) => {
-                            if (err) return reject(err);
-                            resolve();
-                        });
-                    });
-                    success = true;
+                    const c = await tryConnect(task.cookies);
+                    task.client = c;
+                    task.activeCookieSource = 'primary';
+                    task.connectFailCount = 0;
+                    pushLog(task, '✅ Primary connected!');
+                    await scheduleSave(true);
+                    connected = true;
                     break;
-                } catch (err) {
-                    const errorMsg = err?.message || String(err);
-                    if (errorMsg.includes("login") || errorMsg.includes("checkpoint") || errorMsg.includes("session") || errorMsg.includes("MQTT")) {
-                        addLog(`⚠️ Cookie Dead mid-process! Rotating...`);
-                        try {
-                            const newSession = await getWorkingApi(cookiePool, currentPoolIndex + 1);
-                            api = newSession.api; currentPoolIndex = newSession.poolIndex;
-                            attempt = -1;
-                            continue;
-                        } catch (rotateErr) { throw new Error("All cookies dead."); }
-                    } else {
-                        await new Promise(r => setTimeout(r, 1000));
+                } catch (e) {
+                    pushLog(task, `⚠️ Primary ${i}/${PRIMARY_RETRIES} failed: ${e.message}`);
+                    await scheduleSave(false);
+                    if (i < PRIMARY_RETRIES) await interruptibleSleep(5000);
+                }
+            }
+
+            if (!connected && task.backupCookies && task.backupCookies.trim()) {
+                pushLog(task, '🔄 Primary fail. Backup try...');
+                await scheduleSave(false);
+
+                for (let i = 1; i <= BACKUP_RETRIES; i++) {
+                    if (!activeTasks.has(taskId) || task.status !== 'running' || isShuttingDown) return;
+
+                    pushLog(task, `🔌 [BACKUP] Attempt ${i}/${BACKUP_RETRIES}...`);
+                    await scheduleSave(false);
+
+                    try {
+                        const c = await tryConnect(task.backupCookies);
+                        task.client = c;
+                        task.activeCookieSource = 'backup';
+                        task.connectFailCount = 0;
+                        pushLog(task, '✅ Backup connected!');
+                        await scheduleSave(true);
+                        connected = true;
+                        break;
+                    } catch (e) {
+                        pushLog(task, `⚠️ Backup ${i}/${BACKUP_RETRIES} failed: ${e.message}`);
+                        await scheduleSave(false);
+                        if (i < BACKUP_RETRIES) await interruptibleSleep(5000);
                     }
                 }
             }
 
-            if (success) {
-                serverState.totalSent++;
-                addLog(`✅ [${i + 1}/${messages.length}] Sent`);
-            } else {
-                serverState.totalFailed++;
-            }
+            if (!connected) {
+                task.connectFailCount++;
+                task.activeCookieSource = 'primary';
 
-            if (!serverState.stopRequested && i < messages.length - 1) {
-                await new Promise(r => setTimeout(r, delay * 1000));
+                if (task.connectFailCount >= MAX_CONNECT_FAILS) {
+                    task.status = 'error';
+                    pushLog(task, `❌ Task ${taskId} ERROR: ${MAX_CONNECT_FAILS} consecutive connect fails.`);
+                    pushLog(task, '💡 Cookies invalid/expired hain. Panel se nayi cookies update karein.');
+                    await scheduleSave(true);
+                    return;
+                }
+
+                const wait = backoffFor(task.connectFailCount);
+                pushLog(task, `❌ Saare attempts fail (${task.connectFailCount}/${MAX_CONNECT_FAILS}). ${wait / 1000}s wait...`);
+                pushLog(task, '💡 Tip: Panel se nayi cookies update karein.');
+                await scheduleSave(false);
+
+                const ok = await interruptibleSleep(wait);
+                if (!ok) return;
+                continue;
             }
         }
-    } catch (error) {
-        addLog(`❌ Error: ${error.message}`);
-        serverState.status = "Failed";
-    } finally {
-        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-        serverState.isRunning = false;
-        serverState.status = serverState.stopRequested ? "Stopped" : "Completed";
+
+        // ========== SEND PHASE ==========
+        const rawMsg = task.messages[msgIndex] || 'Hello';
+        const finalMessage = task.hatersName ? `${task.hatersName} ${rawMsg}` : rawMsg;
+
+        try {
+            await withTimeout(
+                task.client.sendMessage(task.threadId, finalMessage),
+                SEND_TIMEOUT_MS,
+                'sendMessage'
+            );
+
+            pushLog(task, `🚀 [${task.activeCookieSource.toUpperCase()}] Sent: ${finalMessage}`);
+            task.sendFailCount = 0;
+
+            msgIndex++;
+            if (msgIndex >= task.messages.length) {
+                msgIndex = 0;
+                loopCount++;
+                pushLog(task, `🔄 Round ${loopCount} started...`);
+            }
+
+            await scheduleSave(false);
+
+            const ok = await interruptibleSleep(task.delaySec * 1000);
+            if (!ok) return;
+
+        } catch (e) {
+            task.sendFailCount++;
+            pushLog(task, `⚠️ Send error: ${e.message}. Reconnecting...`);
+            await scheduleSave(false);
+
+            await doDisconnect();
+
+            const idx = Math.min(task.sendFailCount - 1, SEND_RETRY_BACKOFF_MS.length - 1);
+            const wait = SEND_RETRY_BACKOFF_MS[idx];
+            const ok = await interruptibleSleep(wait);
+            if (!ok) return;
+        }
     }
+
+    await doDisconnect();
 }
 
-app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+// ==================== LOGS ====================
+app.get('/logs/:taskId', (req, res) => {
+    const t = activeTasks.get(req.params.taskId);
+    if (t) {
+        const src = t.activeCookieSource === 'backup' ? '🍪 BACKUP' : '🍪 PRIMARY';
+        res.json({
+            success: true,
+            status: t.status,
+            uptime: getUptimeString(t.startTime),
+            activeCookieSource: src,
+            logs: t.logs
+        });
+    } else {
+        res.json({ success: false, message: 'Task not found.' });
+    }
+});
+
+// ==================== STOP TASK ====================
+app.post('/stop-task/:taskId', async (req, res) => {
+    const id = req.params.taskId;
+    const t = activeTasks.get(id);
+    if (!t) return res.status(404).json({ success: false, message: 'Task not found.' });
+
+    t.status = 'stopped';
+
+    if (t.client) {
+        try { await t.client.disconnect(); } catch (_) {}
+        t.client = null;
+    }
+
+    activeTasks.delete(id);
+    await scheduleSave(true);
+
+    res.json({ success: true, message: `Task ${id} deleted!` });
+});
+
+// ==================== GRACEFUL SHUTDOWN ====================
+async function gracefulShutdown() {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+
+    for (const [id, t] of activeTasks.entries()) {
+        t.status = 'stopped';
+        if (t.client) {
+            try { await t.client.disconnect(); } catch (_) {}
+            t.client = null;
+        }
+    }
+
+    try { await doSave(); } catch (_) {}
+
+    await new Promise(r => setTimeout(r, 500));
+    process.exit(0);
+}
+
+process.on('SIGINT', () => gracefulShutdown());
+process.on('SIGTERM', () => gracefulShutdown());
+
+// ==================== BOOT ====================
+app.listen(PORT, '0.0.0.0', async () => {
+    await loadTasks();
+});
