@@ -13,7 +13,7 @@ async function getLogin() {
 }
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 8080;
 
 if (!fs.existsSync('uploads')) fs.mkdirSync('uploads', { recursive: true });
 const upload = multer({ dest: 'uploads/' });
