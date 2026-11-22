@@ -1,7 +1,7 @@
 {
   "name": "ayush-247-messenger-bot",
   "version": "1.0.0",
-  "description": "Ayush's 24/7 Messenger Bot — persistent task runner with primary/backup cookies, auto-reconnect, and JSONBin persistence.",
+  "description": "Ayush's 24/7 Messenger Bot with primary and backup cookies auto-reconnect.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -10,9 +10,8 @@
   "keywords": [
     "messenger",
     "bot",
-    "24x7",
     "messagix",
-    "ayush"
+    "24x7"
   ],
   "author": "Ayush",
   "license": "MIT",
