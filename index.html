@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AYUSH PANDIT </title>
+
+<style>
+body{
+  margin:0;
+  padding:0;
+  background:#001a00;
+  color:#eaffea;
+  font-family:Arial, sans-serif
+}
+
+.container{
+  width:95%;
+  max-width:800px;
+  margin:10px auto
+}
+
+.card{
+  background:rgba(0,255,100,0.08);
+  padding:15px;
+  margin-bottom:15px;
+  border-radius:12px;
+  box-shadow:0 0 12px rgba(0,255,100,0.3)
+}
+
+.card h2{
+  text-align:center;
+  margin-top:0;
+  font-size:1.2rem;
+  border-bottom:1px solid rgba(0,255,100,0.2);
+  padding-bottom:10px;
+  color:#00ff88
+}
+
+label{
+  display:block;
+  margin-top:10px;
+  font-weight:bold;
+  font-size:0.9rem;
+  color:#66ffcc
+}
+
+input, button, select, textarea{
+  width:100%;
+  padding:12px;
+  border-radius:8px;
+  border:none;
+  margin-top:6px;
+  font-size:15px;
+  box-sizing:border-box
+}
+
+textarea{
+  height:100px;
+  resize:vertical;
+  font-family:monospace;
+  background:#eaffea;
+  color:#000
+}
+
+select{
+  background:#ccffdd;
+  color:#000
+}
+
+button{
+  cursor:pointer;
+  font-weight:bold
+}
+
+.green{
+  background:#00ff88;
+  color:#003300;
+  box-shadow:0 0 10px #00ff88
+}
+
+.red{
+  background:#ff4d4d;
+  color:#fff;
+  box-shadow:0 0 10px #ff4d4d
+}
+
+#log{
+  height:200px;
+  overflow-y:auto;
+  background:rgba(0,50,0,0.8);
+  border-radius:8px;
+  padding:10px;
+  font-family:monospace;
+  font-size:12px;
+  white-space:pre-wrap;
+  color:#00ff88
+}
+
+.hidden{
+  display:none
+}
+
+.monitor-item{
+  display:flex;
+  justify-content:space-between;
+  padding:6px 0
+}
+
+.monitor-label{
+  color:#00ffcc;
+  font-weight:bold
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+<div class="card">
+<h2>LIVE TIME 2026 🫂</h2>
+<div class="monitor-item"><span class="monitor-label">🕒 Uptime</span><span id="uptimeValue">0h 0m 0s</span></div>
+<div class="monitor-item"><span class="monitor-label">🚀 Active Tasks</span><span id="activeTasks">0</span></div>
+<div class="monitor-item"><span class="monitor-label">📨 Messages Sent</span><span id="sent">0</span></div>
+</div>
+
+<div class="card">
+<h2>AYUSH</h2>
+
+<label>Cookie Input Method</label>
+<select id="cookieMethod" onchange="toggleCookieInput()">
+<option value="file">Upload Cookie File</option>
+<option value="paste">Paste Cookies</option>
+</select>
+
+<div id="fileInputArea">
+<label>Cookie File</label>
+<input type="file" id="cookieFile" accept=".txt">
+</div>
+
+<div id="pasteInputArea" class="hidden">
+<label>Paste Cookies</label>
+<textarea id="cookieText"></textarea>
+</div>
+
+<label>Message File</label>
+<input type="file" id="msg" accept=".txt">
+
+<label>Thread ID</label>
+<input type="text" id="thread">
+
+<label>Delay (sec)</label>
+<input type="number" id="delay" value="10">
+
+<label>Haters Name</label>
+<input type="text" id="haters">
+
+<label>Last Name</label>
+<input type="text" id="last">
+
+<button id="startBtn" class="green">START TASK</button>
+</div>
+
+<div class="card">
+<h2>STOP TASK</h2>
+<input type="text" id="taskIdInput" placeholder="Task ID">
+<button id="stopBtn" class="red">STOP</button>
+</div>
+
+<div class="card">
+<h2>LOG</h2>
+<div id="log">Waiting...</div>
+</div>
+
+</div>
+
+<script>
+let ws;
+const logBox = document.getElementById("log");
+
+function log(msg){
+  logBox.innerHTML += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+function toggleCookieInput(){
+  const m=document.getElementById("cookieMethod").value;
+  document.getElementById("fileInputArea").classList.toggle("hidden",m!=="file");
+  document.getElementById("pasteInputArea").classList.toggle("hidden",m!=="paste");
+}
+
+function connect(){
+  ws = new WebSocket(
+    (location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws"
+  );
+
+  ws.onopen = () => log("✅ Connected");
+
+  ws.onclose = () => {
+    log("⚠️ Reconnecting...");
+    setTimeout(connect,3000);
+  };
+
+  ws.onmessage = (e)=>{
+    let d;
+    try{ d=JSON.parse(e.data); }catch{ return; }
+
+    if(d.type==="log") log(d.message);
+
+    if(d.type==="task_started"){
+      log(`🚀 Task started | ID: ${d.taskId}`);
+      document.getElementById("taskIdInput").value=d.taskId;
+    }
+
+    if(d.type==="stopped"){
+      log(`⏹ Task stopped | ID: ${d.taskId}`);
+    }
+
+    if(d.type==="monitor_data"){
+      const t = d.uptime;
+      const h = Math.floor(t/3600);
+      const m = Math.floor((t%3600)/60);
+      const s = t%60;
+
+      document.getElementById("uptimeValue").textContent = `${h}h ${m}m ${s}s`;
+      document.getElementById("activeTasks").textContent = d.activeTasks;
+      document.getElementById("sent").textContent = d.totalSent;
+    }
+  };
+}
+
+setInterval(()=>{
+  if(ws && ws.readyState===1){
+    ws.send(JSON.stringify({type:"ping"}));
+  }
+},25000);
+
+setInterval(()=>{
+  if(ws && ws.readyState===1){
+    ws.send(JSON.stringify({type:"monitor"}));
+  }
+},2000);
+
+document.getElementById("startBtn").onclick=()=>{
+  const msgFile = document.getElementById("msg").files[0];
+  if(!msgFile) return alert("Select message file");
+
+  const method = document.getElementById("cookieMethod").value;
+
+  const sendTask = (cookies)=>{
+    const reader = new FileReader();
+    reader.onload = (e)=>{
+      ws.send(JSON.stringify({
+        type:"start",
+        cookieContent:cookies,
+        messageContent:e.target.result,
+        threadID:document.getElementById("thread").value,
+        delay:document.getElementById("delay").value,
+        hatersName:document.getElementById("haters").value,
+        lastHereName:document.getElementById("last").value
+      }));
+      log("⏳ Task sending...");
+    };
+    reader.readAsText(msgFile);
+  };
+
+  if(method==="file"){
+    const f = document.getElementById("cookieFile").files[0];
+    if(!f) return alert("Upload cookie file");
+    const r = new FileReader();
+    r.onload = e=>sendTask(e.target.result);
+    r.readAsText(f);
+  } else {
+    const txt = document.getElementById("cookieText").value;
+    if(!txt.trim()) return alert("Paste cookies");
+    sendTask(txt);
+  }
+};
+
+document.getElementById("stopBtn").onclick=()=>{
+  const id = document.getElementById("taskIdInput").value;
+  if(!id) return alert("Enter Task ID");
+  if(ws && ws.readyState===1){
+    ws.send(JSON.stringify({type:"stop_by_id",taskId:id}));
+  }
+};
+
+connect();
+</script>
+
+</body>
+  </html>
